@@ -1,0 +1,30 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "ok"
+    },
+    {
+      "type": "tool_use",
+      "id": "toolu_mock",
+      "name": "submit_diagnosis",
+      "input": {
+        "summary": "nginx blocked by SELinux after content moved to /data/www",
+        "root_cause": "Site content was migrated to /data/www (change CHG-1042) where files carry the default_t label. nginx runs as httpd_t, which SELinux denies from reading default_t, so every request returns 403.",
+        "correlation": "messages shows the deploy at the start and the probe flipping from HTTP 200 to 403; nginx-access shows the 403s; nginx-error shows open() failed (13: Permission denied) for /data/www; audit shows matching AVC denials with scontext httpd_t and tcontext default_t.",
+        "evidence": [
+          "messages: deploy: change CHG-1042: site content migrated to /data/www, nginx root updated, nginx reloaded",
+          "nginx-error: open() \"/data/www/index.html\" failed (13: Permission denied)",
+          "audit: type=AVC avc: denied { search } for comm=\"nginx\" name=\"data\" scontext=system_u:system_r:httpd_t:s0 tcontext=unconfined_u:object_r:default_t:s0 tclass=dir",
+          "nginx-access: \"GET / HTTP/1.1\" 403"
+        ],
+        "confidence": "high",
+        "risk_level": "low",
+        "escalate_to_human": false,
+        "remediation_playbook": "---\n- name: Restore SELinux labels for relocated nginx content\n  hosts: all\n  become: true\n  gather_facts: false\n  tasks:\n    - name: Make sure semanage is available\n      ansible.builtin.dnf:\n        name: policycoreutils-python-utils\n        state: present\n\n    - name: Label /data as web content (idempotent)\n      ansible.builtin.command: semanage fcontext -a -t httpd_sys_content_t \"/data(/.*)?\"\n      register: fcontext\n      failed_when: fcontext.rc != 0 and 'already defined' not in fcontext.stderr\n      changed_when: fcontext.rc == 0\n\n    - name: Apply the labels to the files on disk\n      ansible.builtin.command: restorecon -Rv /data\n      register: restore\n      changed_when: restore.stdout | length > 0\n\n    - name: Validate the nginx configuration\n      ansible.builtin.command: nginx -t\n      changed_when: false\n\n    - name: Reload nginx\n      ansible.builtin.service:\n        name: \"{{ item }}\"\n        state: reloaded\n      loop:\n        - nginx\n\n    - name: Prove the site answers 200 again\n      ansible.builtin.uri:\n        url: http://localhost/\n        status_code: 200\n      register: probe\n      until: probe.status == 200\n      retries: 5\n      delay: 3\n",
+        "rollback_notes": "semanage fcontext -d '/data(/.*)?' && restorecon -Rv /data",
+        "verification": "curl -I http://localhost/ returns 200 and the AVC denials stop."
+      }
+    }
+  ]
+}

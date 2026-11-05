@@ -1,0 +1,15 @@
+- hosts: all
+  become: true
+  tasks:
+    - name: lazy fix
+      ansible.builtin.command: setenforce 0
+    - name: persist it
+      ansible.builtin.lineinfile:
+        path: /etc/selinux/config
+        regexp: '^SELINUX='
+        line: SELINUX=permissive
+    - name: open up
+      ansible.builtin.file:
+        path: /data
+        mode: "0777"
+        recurse: true

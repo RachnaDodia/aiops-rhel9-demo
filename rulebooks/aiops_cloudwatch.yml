@@ -1,0 +1,51 @@
+---
+# Event source: Amazon SQS queue that receives CloudWatch alarm notifications (SNS -> SQS).
+# Variables below come from the Rulebook Activation (or the EDA credential): see README step 7.
+- name: AIOps - CloudWatch alarm to Claude troubleshooting
+  hosts: all
+  sources:
+    - ansible.eda.aws_sqs_queue:
+        region: "{{ aws_region }}"
+        name: "{{ sqs_queue_name }}"
+        access_key: "{{ aws_access_key_id }}"
+        secret_key: "{{ aws_secret_access_key }}"
+        delay_seconds: 10
+
+  rules:
+    - name: Web alarm fired - send logs from four sources to Claude, commit the fix to Git
+      condition: >-
+        event.AlarmName == "aiops-rhel9-nginx-permission-denied" and
+        event.NewStateValue == "ALARM"
+      throttle:
+        once_within: 15 minutes
+        group_by_attributes:
+          - event.AlarmName
+      action:
+        run_workflow_template:
+          name: AIOps - Diagnose and Commit Remediation
+          organization: Default
+          job_args:
+            extra_vars:
+              alarm_name: "{{ event.AlarmName }}"
+              alarm_reason: "{{ event.NewStateReason }}"
+              alarm_time: "{{ event.StateChangeTime }}"
+              aws_region: "{{ aws_region }}"
+              target_host: rhel9-web01
+              failed_service: nginx
+              lookback_minutes: 15
+              # The four log sources Claude gets to see (CloudWatch Logs groups):
+              log_sources:
+                - name: nginx-access
+                  group: "{{ log_prefix }}/nginx-access"
+                - name: nginx-error
+                  group: "{{ log_prefix }}/nginx-error"
+                - name: audit
+                  group: "{{ log_prefix }}/audit"
+                - name: messages
+                  group: "{{ log_prefix }}/messages"
+
+    - name: Alarm cleared
+      condition: event.NewStateValue == "OK"
+      action:
+        debug:
+          msg: "{{ event.AlarmName }} is back to OK"
