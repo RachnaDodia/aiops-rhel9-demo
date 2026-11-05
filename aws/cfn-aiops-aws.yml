@@ -1,0 +1,166 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: AIOps demo - CloudWatch Logs, metric filter, alarm, SNS -> SQS for Event-Driven Ansible, IAM
+
+Parameters:
+  LogPrefix:
+    Type: String
+    Default: /aiops/rhel9
+    Description: Prefix for the four CloudWatch log groups
+
+Resources:
+  # ---------- Four log sources (shipped by the CloudWatch agent on the VM) ----------
+  NginxAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "${LogPrefix}/nginx-access"
+      RetentionInDays: 3
+  NginxErrorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "${LogPrefix}/nginx-error"
+      RetentionInDays: 3
+  AuditLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "${LogPrefix}/audit"
+      RetentionInDays: 3
+  MessagesLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "${LogPrefix}/messages"
+      RetentionInDays: 3
+
+  # ---------- Log-based alert: nginx cannot read its content ----------
+  PermissionDeniedMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref NginxErrorLogGroup
+      FilterPattern: '"Permission denied"'
+      MetricTransformations:
+        - MetricValue: "1"
+          MetricNamespace: AIOps/Web
+          MetricName: NginxPermissionDenied
+          DefaultValue: 0
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+
+  PermissionDeniedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: aiops-rhel9-nginx-permission-denied
+      AlarmDescription: nginx on the RHEL 9 web host is logging permission denied errors
+      Namespace: AIOps/Web
+      MetricName: NginxPermissionDenied
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 2
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+
+  # ---------- Alert delivery: SNS -> SQS (EDA pulls from SQS, so AAP needs no inbound access) ----------
+  EdaQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: aiops-rhel9-alerts
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 3600
+
+  EdaQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref EdaQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt EdaQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref AlertTopic
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: sqs
+      Endpoint: !GetAtt EdaQueue.Arn
+      RawMessageDelivery: true
+
+  # ---------- IAM ----------
+  VmRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+
+  VmInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref VmRole
+
+  EdaQueueUser:
+    Type: AWS::IAM::User
+    Properties:
+      Policies:
+        - PolicyName: read-alert-queue
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueUrl
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt EdaQueue.Arn
+
+  LogReaderUser:
+    Type: AWS::IAM::User
+    Properties:
+      Policies:
+        - PolicyName: read-aiops-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:FilterLogEvents
+                  - logs:GetLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${LogPrefix}/*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${LogPrefix}/*:*"
+
+Outputs:
+  InstanceProfileName:
+    Description: Attach this instance profile to the RHEL 9 VM
+    Value: !Ref VmInstanceProfile
+  QueueName:
+    Value: !GetAtt EdaQueue.QueueName
+  AlarmName:
+    Value: !Ref PermissionDeniedAlarm
+  EdaQueueUserName:
+    Description: Create an access key for this user and put it in the EDA credential
+    Value: !Ref EdaQueueUser
+  LogReaderUserName:
+    Description: Create an access key for this user and put it in the AAP Amazon Web Services credential (or use your own admin keys)
+    Value: !Ref LogReaderUser

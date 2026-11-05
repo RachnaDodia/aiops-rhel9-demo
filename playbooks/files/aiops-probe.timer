@@ -1,0 +1,8 @@
+[Unit]
+Description=Run the AIOps web probe every 15 seconds
+[Timer]
+OnBootSec=20
+OnUnitActiveSec=15
+AccuracySec=1s
+[Install]
+WantedBy=timers.target

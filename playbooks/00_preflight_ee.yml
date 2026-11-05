@@ -1,0 +1,35 @@
+---
+# Run once to confirm the execution environment has what the demo needs.
+- name: Check the execution environment
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Python libraries
+      ansible.builtin.command: python3 -c "import boto3, botocore, yaml; print('boto3', boto3.__version__)"
+      register: py
+      changed_when: false
+
+    - name: Collections
+      ansible.builtin.shell: ansible-galaxy collection list 2>/dev/null | grep -E "amazon.aws|ansible.posix"
+      register: cols
+      changed_when: false
+      failed_when: cols.stdout_lines | length < 2
+
+    - name: Outbound HTTPS to the services this demo uses
+      ansible.builtin.uri:
+        url: "{{ item }}"
+        method: GET
+        status_code: [200, 301, 302, 400, 401, 403, 404, 405]
+        timeout: 10
+      loop:
+        - https://api.anthropic.com
+        - https://api.github.com
+        - "https://sqs.{{ aws_region | default('ap-south-1') }}.amazonaws.com"
+        - "https://logs.{{ aws_region | default('ap-south-1') }}.amazonaws.com"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Result
+      ansible.builtin.debug:
+        msg: "{{ py.stdout_lines + cols.stdout_lines }}"

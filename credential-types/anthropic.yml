@@ -1,0 +1,13 @@
+# AAP > Automation Execution > Infrastructure > Credential Types > Create
+# Name: Anthropic API
+# Input configuration:
+fields:
+  - id: api_key
+    type: string
+    label: Anthropic API key
+    secret: true
+required:
+  - api_key
+# Injector configuration (paste as a separate field):
+#   env:
+#     ANTHROPIC_API_KEY: "{{ api_key }}"

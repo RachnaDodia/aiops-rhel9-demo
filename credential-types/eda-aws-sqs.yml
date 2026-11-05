@@ -1,0 +1,37 @@
+# AAP > Automation Decisions > Infrastructure > Credential Types > Create
+# Name: AWS SQS alert queue (EDA)
+# Input configuration:
+fields:
+  - id: aws_access_key_id
+    type: string
+    label: Access key ID (EdaQueueUser)
+  - id: aws_secret_access_key
+    type: string
+    label: Secret access key
+    secret: true
+  - id: aws_region
+    type: string
+    label: Region
+    default: ap-south-1
+  - id: sqs_queue_name
+    type: string
+    label: Queue name
+    default: aiops-rhel9-alerts
+  - id: log_prefix
+    type: string
+    label: CloudWatch log group prefix
+    default: /aiops/rhel9
+required:
+  - aws_access_key_id
+  - aws_secret_access_key
+  - aws_region
+  - sqs_queue_name
+  - log_prefix
+# Injector configuration:
+#   extra_vars:
+#     aws_access_key_id: "{{ aws_access_key_id }}"
+#     aws_secret_access_key: "{{ aws_secret_access_key }}"
+#     aws_region: "{{ aws_region }}"
+#     sqs_queue_name: "{{ sqs_queue_name }}"
+#     log_prefix: "{{ log_prefix }}"
+# If your EDA version cannot inject extra_vars, put the same five keys in the activation's Variables field.

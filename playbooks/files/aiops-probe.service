@@ -1,0 +1,5 @@
+[Unit]
+Description=AIOps synthetic web probe
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/aiops-probe

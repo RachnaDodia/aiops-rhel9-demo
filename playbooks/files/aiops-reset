@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Put the demo back to the healthy state.
+set -u
+sed -i "s#^\(\s*\)root .*;#\1root /usr/share/nginx/html;#" /etc/nginx/nginx.conf
+semanage fcontext -d '/data/www(/.*)?' 2>/dev/null || true
+semanage fcontext -d '/data(/.*)?' 2>/dev/null || true
+rm -rf /data
+nginx -t && systemctl reload nginx
+logger -t deploy "demo reset: nginx root restored to /usr/share/nginx/html"
+echo "Reset done."

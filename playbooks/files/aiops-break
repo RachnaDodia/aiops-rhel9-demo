@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# MANUAL FAILURE: simulate a botched site migration.
+# Content is copied to /data/www (labelled default_t, not httpd_sys_content_t) and nginx is
+# pointed at it. SELinux then blocks nginx: 403s, "Permission denied", AVC denials.
+set -euo pipefail
+SRC=/usr/share/nginx/html
+DST=/data/www
+mkdir -p "$DST"
+cp -r "$SRC"/. "$DST"/
+chmod -R a+rX /data
+sed -i "s#^\(\s*\)root .*;#\1root $DST;#" /etc/nginx/nginx.conf
+nginx -t
+systemctl reload nginx
+logger -t deploy "change CHG-1042: site content migrated to $DST, nginx root updated, nginx reloaded"
+echo "Failure injected. The probe starts returning 403 within ~15s; the alarm fires in ~2-3 minutes."

@@ -1,0 +1,12 @@
+# Name: GitHub token (REST API)
+# Input configuration:
+fields:
+  - id: token
+    type: string
+    label: GitHub fine-grained token (Contents RW + Pull requests RW on the remediations repo)
+    secret: true
+required:
+  - token
+# Injector configuration:
+#   env:
+#     GITHUB_TOKEN: "{{ token }}"

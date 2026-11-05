@@ -1,0 +1,236 @@
+---
+# Launched by the EDA rulebook. Pulls logs from >= 3 CloudWatch log groups, asks Claude for
+# a diagnosis + remediation playbook, gates the playbook, and hands it to the next node.
+- name: Collect multi-source logs and ask Claude to troubleshoot
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    aws_region: ap-south-1
+    target_host: rhel9-web01
+    failed_service: nginx
+    alarm_name: manual-run
+    alarm_reason: "n/a"
+    alarm_time: "n/a"
+    lookback_minutes: 15
+    max_lines_per_source: 120
+    log_prefix: /aiops/rhel9
+    log_sources:
+      - { name: nginx-access, group: "{{ log_prefix }}/nginx-access" }
+      - { name: nginx-error,  group: "{{ log_prefix }}/nginx-error" }
+      - { name: audit,        group: "{{ log_prefix }}/audit" }
+      - { name: messages,     group: "{{ log_prefix }}/messages" }
+    min_sources_with_data: 3
+    anthropic_model: claude-sonnet-5-5
+    anthropic_url: https://api.anthropic.com/v1/messages
+    claude_mock_file: ""          # set to samples/mock_claude_response.json to test without an API key
+    system_prompt: |
+      You are a senior Red Hat Enterprise Linux 9 SRE inside an Ansible Automation Platform workflow.
+      A CloudWatch alarm fired. You receive log excerpts forwarded from SEVERAL sources on the same host
+      (web access log, web error log, audit log, system messages). Correlate them: find the single most
+      likely root cause and cite exact log lines, saying which source each came from.
+      Facts about the environment: RHEL 9, SELinux enforcing, nginx, auditd, rsyslog.
+      policycoreutils-python-utils (semanage, restorecon) is installed. The Ansible collections
+      available to you are ansible.builtin and ansible.posix only (not community.general).
+      Then write a remediation Ansible playbook. Rules:
+      - Exactly one play: hosts: all, become: true, gather_facts: false. No roles, no includes.
+      - Fully qualified collection names. Prefer purpose-built modules; use command/shell only where
+        no module exists (for example semanage, restorecon) and make them idempotent
+        (changed_when / failed_when) with a clear task name.
+      - Allowed modules: ansible.builtin.{service, systemd, systemd_service, file, lineinfile, replace,
+        blockinfile, copy, stat, find, dnf, command, shell, assert, debug, wait_for, service_facts,
+        set_fact, uri} and ansible.posix.{seboolean, sysctl, firewalld}. uri may only call localhost.
+      - Fix the cause with the narrowest change. Never disable or loosen SELinux (no setenforce, no
+        permissive mode, no editing /etc/selinux/config, no custom policy modules), never use chmod 777,
+        never reboot, never delete user data, never download remote content, never touch users or SSH keys.
+      - Validate config before reloading services and end with a task that proves the service works again.
+      - Quote every value containing Jinja so the YAML parses.
+      - If the evidence is insufficient or the fix is risky, set escalate_to_human=true and leave
+        remediation_playbook empty.
+      Be concise. Never invent log lines.
+  tasks:
+    - name: Pull the last N minutes from every log source in CloudWatch Logs
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ playbook_dir }}/../scripts/fetch_cloudwatch_logs.py"
+          - --region
+          - "{{ aws_region }}"
+          - --minutes
+          - "{{ lookback_minutes }}"
+          - --max-lines
+          - "{{ max_lines_per_source }}"
+          - --sources
+          - "{{ log_sources | to_json }}"
+      register: fetched
+      changed_when: false
+
+    - name: Parse the log bundle
+      ansible.builtin.set_fact:
+        logs: "{{ fetched.stdout | from_json }}"
+
+    - name: Require data from at least the minimum number of sources
+      ansible.builtin.assert:
+        that:
+          - (logs.sources | dict2items | selectattr('value.lines', 'gt', 0) | list | length) >= (min_sources_with_data | int)
+        fail_msg: "Only {{ logs.sources | dict2items | selectattr('value.lines', 'gt', 0) | list | length }} log sources returned data: {{ logs.sources }}"
+        success_msg: "{{ logs.sources | dict2items | selectattr('value.lines', 'gt', 0) | map(attribute='key') | list }} returned data"
+
+    - name: Build the API request
+      ansible.builtin.set_fact:
+        incident_id: "INC-{{ '%Y%m%d-%H%M%S' | strftime }}"
+        claude_request:
+          model: "{{ anthropic_model }}"
+          max_tokens: 6000
+          system: "{{ system_prompt }}"
+          tool_choice:
+            type: tool
+            name: submit_diagnosis
+          tools:
+            - name: submit_diagnosis
+              description: Return the diagnosis and the remediation playbook.
+              input_schema:
+                type: object
+                required: [summary, root_cause, correlation, evidence, confidence, risk_level, escalate_to_human, remediation_playbook, rollback_notes, verification]
+                properties:
+                  summary:
+                    type: string
+                    description: One line, under 100 characters.
+                  root_cause:
+                    type: string
+                  correlation:
+                    type: string
+                    description: How the different log sources fit together to prove the cause.
+                  evidence:
+                    type: array
+                    items:
+                      type: string
+                    description: "Exact log lines, each prefixed with its source, e.g. 'audit: type=AVC ...'"
+                  confidence:
+                    type: string
+                    enum: [high, medium, low]
+                  risk_level:
+                    type: string
+                    enum: [low, medium, high]
+                  escalate_to_human:
+                    type: boolean
+                  remediation_playbook:
+                    type: string
+                    description: Complete Ansible playbook YAML, or empty string if escalating.
+                  rollback_notes:
+                    type: string
+                  verification:
+                    type: string
+          messages:
+            - role: user
+              content: |
+                ALARM: {{ alarm_name }}
+                time: {{ alarm_time }}
+                reason: {{ alarm_reason }}
+                host: {{ target_host }}   service: {{ failed_service }}
+
+                LOGS FROM {{ logs.sources | length }} SOURCES (last {{ lookback_minutes }} minutes, newest last)
+                {{ logs.bundle }}
+
+    - name: Call the Claude API
+      ansible.builtin.uri:
+        url: "{{ anthropic_url }}"
+        method: POST
+        headers:
+          x-api-key: "{{ lookup('ansible.builtin.env', 'ANTHROPIC_API_KEY') }}"
+          anthropic-version: "2023-06-01"
+        body_format: json
+        body: "{{ claude_request }}"
+        timeout: 180
+        status_code: [200, 400, 401, 403, 404, 429, 500, 529]
+      register: claude_live
+      no_log: true
+      when: claude_mock_file | length == 0
+
+    - name: Use the mock response (offline testing)
+      ansible.builtin.set_fact:
+        claude_live:
+          status: 200
+          json: "{{ lookup('ansible.builtin.file', claude_mock_file) | from_json }}"
+      when: claude_mock_file | length > 0
+
+    - name: Stop with a readable error if the API call failed
+      ansible.builtin.assert:
+        that: claude_live.status | default(-1) == 200
+        fail_msg: "Claude API call failed: HTTP {{ claude_live.status | default('n/a') }} {{ (claude_live.json | default({})).error | default(claude_live.msg | default('')) }}"
+
+    - name: Pull out the structured result
+      ansible.builtin.set_fact:
+        diagnosis: "{{ (claude_live.json.content | selectattr('type', 'equalto', 'tool_use') | first).input }}"
+
+    - name: Show the diagnosis
+      ansible.builtin.debug:
+        msg:
+          - "SUMMARY    : {{ diagnosis.summary }}"
+          - "ROOT CAUSE : {{ diagnosis.root_cause }}"
+          - "CORRELATION: {{ diagnosis.correlation }}"
+          - "CONFIDENCE : {{ diagnosis.confidence }}   RISK: {{ diagnosis.risk_level }}   ESCALATE: {{ diagnosis.escalate_to_human }}"
+          - "EVIDENCE   : {{ diagnosis.evidence }}"
+
+    - name: Show the generated remediation playbook
+      ansible.builtin.debug:
+        msg: "{{ diagnosis.remediation_playbook.splitlines() }}"
+
+    - name: Stop if Claude escalated or returned nothing
+      ansible.builtin.assert:
+        that:
+          - not (diagnosis.escalate_to_human | bool)
+          - diagnosis.remediation_playbook | trim | length > 0
+        fail_msg: "Claude asked for human escalation: {{ diagnosis.root_cause }}"
+
+    - name: Stage the generated playbook
+      ansible.builtin.copy:
+        content: "{{ diagnosis.remediation_playbook }}"
+        dest: "/tmp/{{ incident_id }}-remediation.yml"
+        mode: "0600"
+
+    - name: Policy gate (module allow-list, forbidden commands, SELinux must stay enforcing)
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ playbook_dir }}/../scripts/validate_playbook.py"
+          - "/tmp/{{ incident_id }}-remediation.yml"
+      register: policy_check
+      changed_when: false
+
+    - name: Syntax check the generated playbook
+      ansible.builtin.command:
+        argv:
+          - ansible-playbook
+          - --syntax-check
+          - -i
+          - localhost,
+          - "/tmp/{{ incident_id }}-remediation.yml"
+      changed_when: false
+
+    - name: Policy result
+      ansible.builtin.debug:
+        msg: "{{ policy_check.stdout_lines }}"
+
+    - name: Render the incident report (goes into Git next to the playbook)
+      ansible.builtin.template:
+        src: incident_report.md.j2
+        dest: "/tmp/{{ incident_id }}-report.md"
+        mode: "0600"
+
+    - name: Read both files back as base64
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      loop:
+        - "/tmp/{{ incident_id }}-remediation.yml"
+        - "/tmp/{{ incident_id }}-report.md"
+      register: staged
+
+    # Base64 so the playbook's own {{ }} is not templated while travelling between workflow nodes.
+    - name: Hand results to the next workflow node
+      ansible.builtin.set_stats:
+        data:
+          incident_id: "{{ incident_id }}"
+          incident_summary: "{{ diagnosis.summary | replace('{{', '{ {') | replace('{%', '{ %') }}"
+          remediation_b64: "{{ staged.results[0].content }}"
+          report_b64: "{{ staged.results[1].content }}"

@@ -1,0 +1,125 @@
+---
+# Uploads Claude's playbook + incident report to GitHub through the REST API
+# (no git binary needed in the execution environment). Default: branch + pull request.
+- name: Commit the remediation to Git
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    github_owner: CHANGE_ME
+    github_repo: aiops-remediations
+    github_base_branch: main
+    git_mode: pull_request         # pull_request | direct
+    gh_api: https://api.github.com
+    target_host: rhel9-web01
+    failed_service: nginx
+  tasks:
+    - name: Check inputs from the previous node
+      ansible.builtin.assert:
+        that:
+          - remediation_b64 is defined
+          - remediation_b64 | length > 0
+          - incident_id is defined
+          - github_owner != 'CHANGE_ME'
+
+    - name: Work out names
+      ansible.builtin.set_fact:
+        stem: "{{ incident_id | lower }}-{{ failed_service }}"
+        branch: "{{ ('aiops/' ~ (incident_id | lower)) if git_mode == 'pull_request' else github_base_branch }}"
+        gh_headers:
+          Authorization: "Bearer {{ lookup('ansible.builtin.env', 'GITHUB_TOKEN') }}"
+          Accept: application/vnd.github+json
+          X-GitHub-Api-Version: "2022-11-28"
+          User-Agent: aap-aiops-demo
+      no_log: true
+
+    - name: Read the base branch
+      ansible.builtin.uri:
+        url: "{{ gh_api }}/repos/{{ github_owner }}/{{ github_repo }}/git/ref/heads/{{ github_base_branch }}"
+        headers: "{{ gh_headers }}"
+        status_code: [200, 401, 403, 404]
+      register: base_ref
+      no_log: true
+      when: git_mode == 'pull_request'
+
+    - name: Check the base branch lookup
+      ansible.builtin.assert:
+        that: base_ref.status == 200
+        fail_msg: "GitHub: cannot read {{ github_owner }}/{{ github_repo }}@{{ github_base_branch }} (HTTP {{ base_ref.status | default('n/a') }}). Is the repo created and the token valid?"
+      when: git_mode == 'pull_request'
+
+    - name: Create the incident branch
+      ansible.builtin.uri:
+        url: "{{ gh_api }}/repos/{{ github_owner }}/{{ github_repo }}/git/refs"
+        method: POST
+        headers: "{{ gh_headers }}"
+        body_format: json
+        body:
+          ref: "refs/heads/{{ branch }}"
+          sha: "{{ base_ref.json.object.sha }}"
+        status_code: [201, 401, 403, 404, 422]
+      register: new_branch
+      no_log: true
+      when: git_mode == 'pull_request'
+
+    - name: Check the branch was created
+      ansible.builtin.assert:
+        that: new_branch.status == 201
+        fail_msg: "GitHub: could not create branch {{ branch }} (HTTP {{ new_branch.status | default('n/a') }})"
+      when: git_mode == 'pull_request'
+
+    - name: Upload the files
+      ansible.builtin.uri:
+        url: "{{ gh_api }}/repos/{{ github_owner }}/{{ github_repo }}/contents/{{ item.path }}"
+        method: PUT
+        headers: "{{ gh_headers }}"
+        body_format: json
+        body:
+          message: "{{ item.message }}"
+          content: "{{ item.content }}"
+          branch: "{{ branch }}"
+        status_code: [200, 201, 401, 403, 404, 409, 422]
+      register: uploads
+      no_log: true
+      loop:
+        - path: "remediations/{{ stem }}.yml"
+          message: "{{ incident_id }}: Claude-generated remediation for {{ failed_service }} on {{ target_host }}"
+          content: "{{ remediation_b64 }}"
+        - path: "remediations/{{ stem }}.md"
+          message: "{{ incident_id }}: incident report"
+          content: "{{ report_b64 }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Check the uploads
+      ansible.builtin.assert:
+        that: uploads.results | map(attribute='status') | select('in', [200, 201]) | list | length == 2
+        fail_msg: "GitHub upload failed: {{ uploads.results | map(attribute='status') | list }}"
+
+    - name: Open the pull request
+      ansible.builtin.uri:
+        url: "{{ gh_api }}/repos/{{ github_owner }}/{{ github_repo }}/pulls"
+        method: POST
+        headers: "{{ gh_headers }}"
+        body_format: json
+        body:
+          title: "{{ incident_id }}: {{ incident_summary | default('AIOps remediation') }}"
+          head: "{{ branch }}"
+          base: "{{ github_base_branch }}"
+          body: "{{ report_b64 | b64decode }}"
+        status_code: [201, 401, 403, 404, 422]
+      register: pr
+      no_log: true
+      when: git_mode == 'pull_request'
+
+    - name: Check the pull request
+      ansible.builtin.assert:
+        that: pr.status == 201
+        fail_msg: "GitHub: pull request failed (HTTP {{ pr.status | default('n/a') }})"
+      when: git_mode == 'pull_request'
+
+    - name: Where to find it
+      ansible.builtin.debug:
+        msg:
+          - "Playbook: https://github.com/{{ github_owner }}/{{ github_repo }}/blob/{{ branch }}/remediations/{{ stem }}.yml"
+          - "{{ ('Pull request: ' ~ pr.json.html_url) if git_mode == 'pull_request' else 'Committed directly to ' ~ github_base_branch }}"

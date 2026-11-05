@@ -1,0 +1,117 @@
+---
+# Builds the "healthy" application on the fresh RHEL 9 VM and ships four logs to CloudWatch.
+- name: Baseline the RHEL 9 web host
+  hosts: rhel9_web
+  become: true
+  vars:
+    aws_region: ap-south-1
+    log_prefix: /aiops/rhel9
+    aiops_site_root: /usr/share/nginx/html
+    cw_arch: "{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}"
+  tasks:
+    - name: SELinux must be enforcing for this scenario
+      ansible.builtin.command: getenforce
+      register: selinux_mode
+      changed_when: false
+      failed_when: selinux_mode.stdout != 'Enforcing'
+
+    - name: The VM needs the IAM instance profile from the CloudFormation stack
+      ansible.builtin.shell: |
+        TOKEN=$(curl -sS -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
+        curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/iam/security-credentials/
+      register: role_check
+      changed_when: false
+      failed_when: role_check.stdout | trim | length == 0 or 'Not Found' in role_check.stdout or '<' in role_check.stdout
+
+    - name: Install packages
+      ansible.builtin.dnf:
+        name:
+          - nginx
+          - policycoreutils-python-utils
+          - rsyslog
+          - audit
+          - curl
+        state: present
+
+    - name: Make sure rsyslog (writes /var/log/messages) and auditd are running
+      ansible.builtin.service:
+        name: "{{ item }}"
+        state: started
+        enabled: true
+      loop:
+        - rsyslog
+        - auditd
+
+    - name: nginx.conf (single site)
+      ansible.builtin.template:
+        src: nginx.conf.j2
+        dest: /etc/nginx/nginx.conf
+        owner: root
+        group: root
+        mode: "0644"
+        validate: nginx -t -c %s
+      notify: Reload nginx
+
+    - name: Site content
+      ansible.builtin.copy:
+        dest: "{{ aiops_site_root }}/index.html"
+        content: "<h1>Acme Orders Portal</h1><p>status: OK</p>\n"
+        mode: "0644"
+
+    - name: Start nginx
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true
+
+    - name: Install probe, break and reset scripts
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "/usr/local/sbin/{{ item }}"
+        mode: "0755"
+      loop:
+        - aiops-probe
+        - aiops-break
+        - aiops-reset
+
+    - name: Install probe timer (synthetic traffic every 15s, results also logged to syslog)
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "/etc/systemd/system/{{ item }}"
+        mode: "0644"
+      loop:
+        - aiops-probe.service
+        - aiops-probe.timer
+      notify: Enable probe timer
+
+    - name: Install the CloudWatch agent
+      ansible.builtin.dnf:
+        name: "https://amazoncloudwatch-agent.s3.amazonaws.com/redhat/{{ cw_arch }}/latest/amazon-cloudwatch-agent.rpm"
+        state: present
+        disable_gpg_check: true   # demo only; import the AWS agent signing key for production
+
+    - name: CloudWatch agent configuration (nginx access/error, audit, messages)
+      ansible.builtin.template:
+        src: cwagent.json.j2
+        dest: /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+        mode: "0644"
+      notify: Apply CloudWatch agent config
+
+  handlers:
+    - name: Reload nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded
+
+    - name: Enable probe timer
+      ansible.builtin.systemd:
+        name: aiops-probe.timer
+        state: started
+        enabled: true
+        daemon_reload: true
+
+    - name: Apply CloudWatch agent config
+      ansible.builtin.command: >
+        /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl
+        -a fetch-config -m ec2 -s
+        -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json

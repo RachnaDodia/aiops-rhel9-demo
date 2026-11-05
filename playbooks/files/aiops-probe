@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Synthetic probe: hit the site and record the result in syslog (/var/log/messages).
+code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost/ || true)
+logger -t aiops-probe "GET http://localhost/ -> HTTP ${code:-000}"

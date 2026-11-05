@@ -1,0 +1,25 @@
+---
+- name: Deploy the AWS side of the demo (CloudWatch, alarm, SNS, SQS, IAM)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    aws_region: ap-south-1
+    stack_name: aiops-rhel9-demo
+    log_prefix: /aiops/rhel9
+  tasks:
+    - name: Create or update the CloudFormation stack
+      amazon.aws.cloudformation:
+        stack_name: "{{ stack_name }}"
+        state: present
+        region: "{{ aws_region }}"
+        template: "{{ playbook_dir }}/../aws/cfn-aiops-aws.yml"
+        template_parameters:
+          LogPrefix: "{{ log_prefix }}"
+        capabilities:
+          - CAPABILITY_IAM
+      register: stack
+
+    - name: Values you need for the next steps
+      ansible.builtin.debug:
+        var: stack.stack_outputs
